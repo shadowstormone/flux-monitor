@@ -197,16 +197,53 @@ function restart()
 end
 ]]
 
-local function rcEnabled()
-    -- Считываем /etc/rc.cfg — там в массиве enabled или в формате
-    -- enabled = {"foo", "bar"} перечислены активные сервисы.
-    local cfgPath = "/etc/rc.cfg"
-    if not fs.exists(cfgPath) then return false end
-    local f = io.open(cfgPath, "r"); if not f then return false end
+-- ---------- Работа с /etc/rc.cfg напрямую ----------
+-- Не используем rc.enable/rc.disable — таких публичных функций в API
+-- модуля "rc" не существует (это была моя ошибка в первой версии).
+-- Вместо этого парсим rc.cfg как Lua-скрипт в изолированное окружение,
+-- модифицируем таблицу enabled и сериализуем обратно. Это работает в любой
+-- версии OpenOS, потому что формат rc.cfg стабилен и тривиален.
+
+local RC_CFG = "/etc/rc.cfg"
+
+local function readRcCfg()
+    local cfg = {}
+    if not fs.exists(RC_CFG) then return cfg end
+    local f = io.open(RC_CFG, "r")
+    if not f then return cfg end
     local content = f:read("*a"); f:close()
-    -- Достаточно простой проверки наличия имени сервиса в файле
-    return content:find('"' .. RC_NAME .. '"', 1, true) ~= nil
-       or  content:find("'" .. RC_NAME .. "'", 1, true) ~= nil
+    -- load с пустым _ENV: все присваивания упадут в cfg
+    local fn = load(content, "rc.cfg", "t", cfg)
+    if fn then pcall(fn) end
+    if type(cfg.enabled) ~= "table" then cfg.enabled = {} end
+    return cfg
+end
+
+local function writeRcCfg(cfg)
+    local serialization = require("serialization")
+    if type(cfg.enabled) ~= "table" then cfg.enabled = {} end
+    local lines = { "enabled = " .. serialization.serialize(cfg.enabled) }
+    -- Сохраняем остальные поля если они были (на будущее — мало ли что
+    -- там окажется, не хотим затирать чужие настройки)
+    for k, v in pairs(cfg) do
+        if k ~= "enabled" then
+            local ok, ser = pcall(serialization.serialize, v)
+            if ok then table.insert(lines, k .. " = " .. ser) end
+        end
+    end
+    local f, err = io.open(RC_CFG, "w")
+    if not f then return false, err end
+    f:write(table.concat(lines, "\n") .. "\n")
+    f:close()
+    return true
+end
+
+local function rcEnabled()
+    local cfg = readRcCfg()
+    for _, name in ipairs(cfg.enabled) do
+        if name == RC_NAME then return true end
+    end
+    return false
 end
 
 local function isAutostartEnabled()
@@ -214,34 +251,44 @@ local function isAutostartEnabled()
 end
 
 local function enableAutostart()
-    -- Записываем сам rc-скрипт
+    -- 1. Создаём rc-скрипт сервиса
     if not fs.exists(RC_DIR) then
         local mkOk, mkErr = fs.makeDirectory(RC_DIR)
-        if not mkOk then return false, "не удалось создать " .. RC_DIR .. ": " .. tostring(mkErr) end
+        if not mkOk then
+            return false, "не удалось создать " .. RC_DIR .. ": " .. tostring(mkErr)
+        end
     end
     local f, ferr = io.open(RC_PATH, "w")
-    if not f then return false, ferr end
+    if not f then return false, "не удалось создать " .. RC_PATH .. ": " .. tostring(ferr) end
     f:write(RC_SCRIPT); f:close()
 
-    -- Включаем сервис через rc API. Используем pcall на случай если
-    -- модуль rc недоступен (нестандартная сборка OpenOS).
-    local rcOk, rc = pcall(require, "rc")
-    if not rcOk then
-        return false, "модуль rc не найден — но файл " .. RC_PATH ..
-                      " создан, можно включить вручную: rc " .. RC_NAME .. " enable"
+    -- 2. Включаем имя сервиса в /etc/rc.cfg (без дублирования)
+    local cfg = readRcCfg()
+    local already = false
+    for _, name in ipairs(cfg.enabled) do
+        if name == RC_NAME then already = true; break end
     end
-    local enOk, enErr = pcall(rc.enable, RC_NAME)
-    if not enOk then return false, tostring(enErr) end
+    if not already then
+        table.insert(cfg.enabled, RC_NAME)
+    end
+    local wok, werr = writeRcCfg(cfg)
+    if not wok then
+        return false, "не удалось записать " .. RC_CFG .. ": " .. tostring(werr)
+    end
     return true
 end
 
 local function disableAutostart()
-    -- Сначала отключаем через rc.disable (стирает запись из rc.cfg)
-    pcall(function()
-        local rc = require("rc")
-        rc.disable(RC_NAME)
-    end)
-    -- Потом удаляем сам файл скрипта
+    -- 1. Удаляем имя из enabled в rc.cfg
+    local cfg = readRcCfg()
+    local newEnabled = {}
+    for _, name in ipairs(cfg.enabled) do
+        if name ~= RC_NAME then table.insert(newEnabled, name) end
+    end
+    cfg.enabled = newEnabled
+    pcall(writeRcCfg, cfg)
+
+    -- 2. Удаляем файл сервиса
     if fs.exists(RC_PATH) then
         local rmOk, rmErr = fs.remove(RC_PATH)
         if not rmOk then return false, rmErr end
