@@ -1,316 +1,127 @@
 -- ============================================================================
--- component_probe.lua — универсальный сканер всех OC-компонентов
+-- component_probe.lua — универсальный сканер OC-компонентов
 -- ----------------------------------------------------------------------------
--- Что делает: то же что flux_probe для одного контроллера, но по ВСЕЙ
--- компонентной сети компьютера. Полезно когда:
---   • На сервере стоят моды с непонятными именами компонентов (Modular
---     Machinery, прокаченные AE2, кастомные мультиблоки) и нужно понять
---     что вообще доступно.
---   • Хочется получить готовый список адресов и методов для последующего
---     написания специализированных скриптов.
---   • Нужно проверить, какой компонент за что отвечает — без чтения
---     исходников мода.
---
--- Алгоритм:
---   1) Перечисляет все компоненты через component.list().
---   2) Для каждого: получает все методы через component.methods(), читает
---      документацию через component.doc(), безопасно вызывает все getter/
---      list/is методы без аргументов через pcall.
---   3) Эвристически классифицирует компонент по имени и сигнатуре методов
---      (энергия, хранилище, крафт, мультиблок, IO и т.д.).
---   4) Сохраняет полный отчёт в /home/component_probe.log с подсветкой
---      под viewer.lua (===, ✓, ✗, >>>).
+-- ЗАЩИТА ОТ ЭНЕРГОЖОРА (актуально для больших сетей вроде HiTech):
+--   • Чёрный список заведомо тяжёлых методов (getItemsInNetwork, getCraftables
+--     и т.п.) — пропускаются по умолчанию, можно включить через --full.
+--   • Лимит размера ответа: если метод вернул таблицу >50 элементов — только
+--     количество, без полного дампа.
+--   • Паузы между вызовами методов и между компонентами — даёт конденсаторам
+--     перезарядиться от подключённой Power Supply / Capacitor.
+--   • Контроль энергии: если перед компонентом осталось <25% — ждём
+--     перезарядки до 80% или (если не подключено питание) останавливаемся
+--     с сохранением частичного результата.
+--   • Инкрементальный flush в лог после каждого компонента — даже если
+--     компьютер всё-таки упадёт, в /home/component_probe.log останется всё
+--     до точки падения.
 --
 -- Запуск:
---   component_probe              # сканировать всё
---   component_probe <фильтр>     # только компоненты, содержащие <фильтр>
---                                # в имени (например "machinery", "ae2")
+--   component_probe                  — безопасный режим (пропуск тяжёлых)
+--   component_probe <фильтр>         — только компоненты с подстрокой в имени
+--   component_probe --quick          — ТОЛЬКО сводка, без вызовов методов
+--   component_probe --no-methods     — методы перечислить, но не вызывать
+--   component_probe --full           — ВКЛЮЧАЯ тяжёлые методы (рискованно!)
+--   component_probe --no-doc         — не запрашивать документацию (ускорение)
+--   component_probe --max-size N     — лимит размера дампа таблиц (по умолч. 50)
 -- ============================================================================
 
 local component = require("component")
+local computer  = require("computer")
 local fs        = require("filesystem")
 local shell     = require("shell")
 
 -- ---------- Параметры запуска ----------
-local args     = shell.parse(...)
-local nameFilter = args[1]     -- nil = без фильтра
-local LOG_PATH = "/home/component_probe.log"
+local args, opts = shell.parse(...)
+local nameFilter = args[1]      -- nil = без фильтра
+local QUICK      = opts.quick      or false
+local NO_METHODS = opts["no-methods"] or false
+local FULL       = opts.full       or false
+local NO_DOC     = opts["no-doc"]  or false
+local MAX_DUMP   = tonumber(opts["max-size"]) or 50
+local LOG_PATH   = "/home/component_probe.log"
 
+-- ---------- Чёрный список тяжёлых методов ----------
+-- Эти методы возвращают огромные списки и стабильно укладывают компьютер
+-- даже на HiTech-сборках с приличным запасом энергии. Включается через --full.
+local HEAVY_METHODS = {
+    -- AE2 — могут вернуть тысячи предметов / рецептов
+    getItemsInNetwork  = true,
+    getCraftables      = true,
+    getCpus            = true,
+    getFluidsInNetwork = true,
+    -- Flux — список всех устройств сети
+    getDevices         = true,
+    getStorages        = true,
+    getNetworkDevices  = true,
+    getNetworkStorages = true,
+    getPlugs           = true,
+    getPoints          = true,
+    getControllers     = true,
+    -- Modular Machinery
+    getRecipes         = true,
+    getActiveRecipe    = true,
+    getInputBuses      = true,
+    getOutputBuses     = true,
+    -- Forestry / пчёлы — длинные генетические таблицы
+    getIndividualOnDisplay = true,
+    getQueen           = true,
+    -- Большие инвентари
+    getAllStacks       = true,
+    getStackInSlot     = true,
+}
+
+-- ---------- Логгер с инкрементальным flush ----------
 local logFile = io.open(LOG_PATH, "w")
 local function log(s)
     s = s or ""
     print(s)
-    if logFile then logFile:write(s .. "\n"); logFile:flush() end
+    if logFile then
+        logFile:write(s .. "\n")
+        logFile:flush()  -- критично: при kernel panic данные останутся на диске
+    end
 end
 
--- ============================================================================
--- ЭВРИСТИКА: классификация компонента по имени и набору методов
--- ============================================================================
--- Назначение: дать пользователю человекочитаемое описание ЧТО это, без
--- необходимости читать вики мода. Эвристика двухуровневая:
---   1) Точные совпадения имён хорошо известных компонентов (flux, me_*,
---      tank_controller и т.п.) — выдают точное описание.
---   2) Общие правила по словам в имени и по наличию характерных методов
---      (например getEnergyStored → накопитель энергии).
-
--- Уровень 1: точные имена и их назначение
-local KNOWN_COMPONENTS = {
-    -- OC core
-    ["computer"]          = "Управление самим ПК (выкл, ребут, статус)",
-    ["gpu"]               = "Графический процессор: вывод на экран",
-    ["screen"]            = "Экран. Источник событий touch/scroll",
-    ["filesystem"]        = "Файловая система (ЖД, дискета, tmpfs)",
-    ["eeprom"]            = "BIOS компьютера",
-    ["modem"]             = "Сетевая карта (беспроводная связь между ПК)",
-    ["tunnel"]            = "Linked-card: точечная связь между двумя ПК",
-    ["redstone"]          = "I/O редстоуна",
-    ["internet"]          = "Internet Card: HTTP/HTTPS и raw TCP",
-    ["data"]              = "Карта данных: хеширование, шифрование, base64",
-    ["transposer"]        = "Транспозер: перемещение предметов и жидкостей",
-    ["robot"]             = "API робота",
-    ["drone"]             = "API дрона",
-    ["geolyzer"]           = "Геоанализатор: сканирование блоков вокруг",
-    ["motion_sensor"]      = "Датчик движения мобов/игроков рядом",
-    ["debug"]              = "Debug Card (только в креативе): мощные методы",
-
-    -- Flux Networks
-    ["flux_controller"]   = "Контроллер Flux Network: статистика и сеть",
-    ["flux_plug"]         = "Точка ввода энергии в Flux-сеть",
-    ["flux_point"]        = "Точка вывода энергии из Flux-сети",
-    ["flux_storage"]      = "Накопитель энергии Flux Network",
-
-    -- AE2 + аддоны (на HiTech: Applied Energistics 2, AE2 Stuff, Lazy AE2)
-    ["me_controller"]     = "AE2 Контроллер ME: процессоры крафта, предметы",
-    ["me_interface"]      = "AE2 ME интерфейс: автоматизация I/O сети",
-    ["me_exportbus"]      = "AE2 экспортная шина",
-    ["me_importbus"]      = "AE2 импортная шина",
-    ["me_drive"]          = "AE2 привод накопителей",
-    ["me_iobus"]          = "AE2 универсальная шина I/O",
-    ["me_inscriber"]      = "AE2 пресс/инскрайбер (AE2 Stuff)",
-
-    -- Computronics (точно на HiTech)
-    ["chat_box"]              = "Computronics: чат-бокс для приёма/отправки сообщений",
-    ["tape_drive"]            = "Computronics: ленточный накопитель (звук/данные)",
-    ["colorful_lamp"]         = "Computronics: программируемая RGB-лампа",
-    ["industrial_chunkloader"]= "Computronics: чанклоадер с управлением",
-    ["radar"]                 = "Computronics: радар обнаружения сущностей",
-    ["self_destruct"]         = "Computronics: блок самоуничтожения",
-    ["digital_railroad"]      = "Computronics: контроллер железной дороги",
-    ["cipher"]                = "Computronics: шифрование данных",
-
-    -- Energy Control (точно на HiTech)
-    ["energy_sensor"]         = "Energy Control: датчик уровня энергии в IC2/RF/EU",
-    ["howler_alarm"]          = "Energy Control: сирена-оповещатель",
-    ["info_panel"]            = "Energy Control: информационная панель (вывод текста в мире)",
-    ["info_panel_advanced"]   = "Energy Control: расширенная инфо-панель",
-    ["thermometer"]           = "Energy Control: термометр для реакторов",
-    ["range_trigger"]         = "Energy Control: триггер по диапазону значений",
-    ["counter"]               = "Energy Control: счётчик (предметов/энергии)",
-
-    -- OpenSecurity (точно на HiTech)
-    ["os_alarm"]              = "OpenSecurity: сирена тревоги",
-    ["os_cardwriter"]         = "OpenSecurity: программатор карт доступа",
-    ["os_doorcontroller"]     = "OpenSecurity: контроллер дверей",
-    ["os_energyturret"]       = "OpenSecurity: энергетическая турель",
-    ["os_keypad"]             = "OpenSecurity: цифровая клавиатура",
-    ["os_magreader"]          = "OpenSecurity: считыватель магнитных карт",
-    ["os_securitydoor"]       = "OpenSecurity: защищённая дверь",
-    ["os_rfidreader"]         = "OpenSecurity: RFID-сканер",
-    ["entity_detector"]       = "OpenSecurity: детектор сущностей в радиусе",
-    ["biometric_reader"]      = "OpenSecurity: биометрический сканер",
-
-    -- OpenGlasses2 / OpenScreens (точно на HiTech)
-    ["glasses"]               = "OpenGlasses: связь с очками-HUD игрока",
-    ["glasses_terminal"]      = "OpenGlasses: терминал-передатчик HUD",
-    ["openscreens_screen"]    = "OpenScreens: расширенный экран",
-    ["openglasses_host"]      = "OpenGlasses: хост-блок для трансляции в очки",
-
-    -- OpenExtensions (кастомный мост OC ↔ другие моды на HiTech)
-    ["oc_eio"]                = "OpenExtensions: интеграция с Ender IO",
-    ["oc_botania"]            = "OpenExtensions: интеграция с Botania",
-    ["oc_forestry"]           = "OpenExtensions: интеграция с Forestry (пчёлы и пр.)",
-
-    -- Modular Machinery / Modular Assembly (точно на HiTech)
-    ["modular_machinery"]     = "Modular Machinery: контроллер кастомного мультиблока",
-    ["modular_assembly"]      = "Modular Assembly: кастомная сборочная машина",
-    ["mm_controller"]         = "Modular Machinery контроллер",
-    ["machine_controller"]    = "Контроллер машины (общий тип)",
-
-    -- Ender IO (точно на HiTech)
-    ["enderio:capacitor_bank"]= "Ender IO: банк конденсаторов (хранилище RF)",
-    ["capacitor_bank"]        = "Ender IO: банк конденсаторов",
-
-    -- Draconic Evolution (точно на HiTech)
-    ["draconic_rfstorage"]    = "Draconic Evolution: энергоядро (огромное RF-хранилище)",
-    ["draconic_reactor"]      = "Draconic Evolution: реактор (требует точного управления!)",
-
-    -- IndustrialCraft 2 (точно на HiTech)
-    ["energy_machine"]        = "IC2/GT: машина с энергобуфером",
-    ["transformer"]           = "Трансформатор напряжения",
-    ["batbox"]                = "Накопитель энергии IC2",
-    ["nuclear_reactor"]       = "Ядерный реактор IC2",
-    ["mfsu"]                  = "MFSU: накопитель IC2 высокого напряжения",
-    ["mfe"]                   = "MFE: средний накопитель IC2",
-    ["industrial_centrifuge"] = "IC2: промышленная центрифуга",
-
-    -- Thermal Expansion (точно на HiTech)
-    ["energy_cell"]           = "Thermal Expansion: ячейка энергии (RF)",
-    ["thermal_machine"]       = "Thermal Expansion машина",
-
-    -- Forestry / Gendustry / Binnie (точно на HiTech)
-    ["bee_housing"]           = "Forestry: пчелиный домик/улей/альвеарий",
-    ["apiary"]                = "Forestry: апиарий (улей)",
-    ["analyzer"]              = "Forestry/Binnie: анализатор пчёл/деревьев",
-    ["industrial_apiary"]     = "Gendustry: индустриальный апиарий",
-    ["mutatron"]              = "Gendustry: мутатрон для скрещивания пчёл",
-    ["genetic_imprinter"]     = "Gendustry: генетический импринтер",
-
-    -- Tank/жидкости (общее, может быть от Forestry/TE/IC2)
-    ["tank_controller"]       = "Контроллер бака с жидкостью",
-
-    -- McSkill кастомные моды (точные имена выяснишь probe-ом)
-    ["mcskill_apex"]          = "McSkill Apex: квантовая кирка/голограмма/базука",
-    ["mcskill_genesis"]       = "McSkill Genesis: паспорт/PvP-статус/табло",
-    ["holo_projector"]        = "McSkill Apex: голографический проектор",
-    ["chunk_loader_apex"]     = "McSkill Apex: продвинутый якорь чанков",
-}
-
--- Уровень 2: правила по подстрокам в имени
-local NAME_HINTS = {
-    -- Общая энергетика
-    { "energy",     "Работает с энергией"                },
-    { "battery",    "Накопитель энергии"                 },
-    { "rf_",        "Источник/потребитель RF"            },
-    { "_rf",        "Источник/потребитель RF"            },
-    { "_fe",        "Forge Energy устройство"            },
-    { "capacitor",  "Накопитель/конденсатор энергии"     },
-    -- Жидкости
-    { "fluid",      "Работа с жидкостями"                },
-    { "tank",       "Резервуар жидкости"                 },
-    { "boiler",     "Парогенератор"                      },
-    -- Транспорт
-    { "fluxduct",   "Канал передачи энергии"             },
-    { "pipe",       "Труба для предметов/жидкостей"      },
-    { "duct",       "Канал/проводник (Thermal/прочие)"   },
-    -- Инвентари
-    { "inventory",  "Имеет инвентарь предметов"          },
-    { "chest",      "Сундук/инвентарь"                   },
-    { "barrel",     "Бочка/хранилище предметов"          },
-    { "transposer", "Перемещение предметов/жидкостей"    },
-    -- Машины
-    { "crafter",    "Автоматический крафт"               },
-    { "furnace",    "Печь/нагреватель"                   },
-    { "smelter",    "Плавильня"                          },
-    { "reactor",    "Реактор"                            },
-    { "turbine",    "Турбина"                            },
-    { "generator",  "Генератор энергии"                  },
-    { "machine",    "Машина (устройство с автоматикой)"  },
-    { "controller", "Контроллер мультиблока/системы"     },
-    { "modular",    "Modular Machinery / модульная сборка"},
-    -- Конкретные моды HiTech
-    { "ae2",        "Applied Energistics 2 устройство"   },
-    { "_me_",       "AE2 ME-устройство"                  },
-    { "matrix",     "Накопитель энергоматрицы"           },
-    { "draconic",   "Draconic Evolution устройство"      },
-    { "thermal",    "Thermal Series устройство"          },
-    { "mekanism",   "Mekanism устройство"                },
-    { "ic2",        "IndustrialCraft 2 устройство"       },
-    { "gregtech",   "GregTech устройство"                },
-    { "extreme",    "Extreme/Extended Reactors устройство"},
-    { "enderio",    "Ender IO устройство"                },
-    { "ender_io",   "Ender IO устройство"                },
-    -- Computronics
-    { "computronic", "Computronics устройство"           },
-    { "tape",       "Computronics ленточный носитель"    },
-    -- Energy Control
-    { "info_panel", "Energy Control инфо-панель"         },
-    { "sensor",     "Датчик/сенсор"                      },
-    { "alarm",      "Сирена/тревога"                     },
-    -- OpenSecurity
-    { "card",       "Карта доступа / считыватель"        },
-    { "rfid",       "RFID устройство"                    },
-    { "biometric",  "Биометрический сканер"              },
-    { "keypad",     "Клавиатура для ввода пинкода"       },
-    { "turret",     "Турель/стрелковая установка"        },
-    -- OpenGlasses
-    { "glasses",    "OpenGlasses связь с HUD-очками"     },
-    -- Forestry
-    { "bee",        "Forestry пчёлы"                     },
-    { "apiary",     "Forestry/Gendustry апиарий (улей)"  },
-    { "tree",       "Дерево/древесина (Forestry)"        },
-    { "genetic",    "Gendustry генетика"                 },
-    -- McSkill кастомные
-    { "apex",       "McSkill Apex"                       },
-    { "genesis",    "McSkill Genesis"                    },
-    { "mcskill",    "Кастомный мод McSkill"              },
-    { "holo",       "Голографический блок"               },
-    -- Generic
-    { "miner",      "Шахтёр/майнер (рудокоп)"            },
-    { "drilling",   "Бур/буровая установка"              },
-    { "spawner",    "Спавнер мобов"                      },
-    { "auto",       "Автоматизированное устройство"      },
-}
-
--- Уровень 3: правила по сигнатуре методов (если есть характерный метод)
-local METHOD_HINTS = {
-    { "getEnergyStored",      "Хранит энергию (RF/FE/EU)"           },
-    { "getMaxEnergyStored",   "Имеет ёмкость энергобуфера"          },
-    { "getEnergyInfo",        "Отдаёт расширенную статистику энергии"},
-    { "getCpus",              "Управляет crafting-процессорами"     },
-    { "getItemsInNetwork",    "Хранит предметы в сети"              },
-    { "getCraftables",        "Может крафтить предметы по запросу"  },
-    { "getFluidInTank",       "Содержит жидкости"                   },
-    { "getTankInfo",          "Имеет резервуар"                     },
-    { "getStackInSlot",       "Имеет инвентарь предметов"           },
-    { "isMachineActive",      "Машина с состоянием активности"      },
-    { "getRecipeProgress",    "Машина с прогрессом крафта"          },
-    { "getMachineStatus",     "Машина с диагностикой"               },
-    { "isWorking",            "Машина с режимом работы"             },
-    { "getWork",              "Отдаёт информацию о текущей работе"  },
-    { "getOutput", "Имеет выход продукции (предмет/жидкость/энергия)"},
-    { "transferItem",         "Может перемещать предметы"           },
-    { "getStorages",          "Имеет список подключённых хранилищ"  },
-}
-
-local function classify(name, methods)
-    local descriptions = {}
-
-    -- Уровень 1: точное имя
-    if KNOWN_COMPONENTS[name] then
-        table.insert(descriptions, KNOWN_COMPONENTS[name])
-    end
-
-    -- Уровень 2: подстроки в имени (нижний регистр)
-    local lname = name:lower()
-    for _, hint in ipairs(NAME_HINTS) do
-        if lname:find(hint[1], 1, true) then
-            -- Не дублируем если такая же подсказка уже была
-            local dup = false
-            for _, existing in ipairs(descriptions) do
-                if existing == hint[2] then dup = true; break end
-            end
-            if not dup then table.insert(descriptions, hint[2]) end
-        end
-    end
-
-    -- Уровень 3: характерные методы
-    if methods then
-        for _, hint in ipairs(METHOD_HINTS) do
-            if methods[hint[1]] then
-                table.insert(descriptions, hint[2])
-            end
-        end
-    end
-
-    if #descriptions == 0 then
-        return "Неизвестный/кастомный компонент — см. список методов ниже"
-    end
-    return table.concat(descriptions, "; ")
+-- ---------- Энергетика ----------
+local function energyPct()
+    local maxE = computer.maxEnergy()
+    if maxE == 0 then return 100 end
+    return (computer.energy() / maxE) * 100
 end
 
--- ============================================================================
--- БЕЗОПАСНЫЙ ДАМП ЗНАЧЕНИЙ
--- ============================================================================
+-- Ждём пока энергия не вырастет до targetPct (или maxWait секунд)
+local function waitForEnergy(targetPct, maxWait)
+    targetPct = targetPct or 80
+    maxWait = maxWait or 30
+    local startE = energyPct()
+    if startE >= targetPct then return true end
+
+    log(string.format("[ЭНЕРГИЯ] %.0f%% — жду перезарядки до %d%%...",
+        startE, targetPct))
+
+    local deadline = computer.uptime() + maxWait
+    local lastE = startE
+    local stagnantSince = computer.uptime()
+    while computer.uptime() < deadline do
+        os.sleep(1)
+        local cur = energyPct()
+        if cur >= targetPct then
+            log(string.format("[ЭНЕРГИЯ] OK %.0f%%, продолжаю", cur))
+            return true
+        end
+        -- Если энергия не растёт более 5 секунд — нет питания
+        if cur > lastE + 0.5 then
+            stagnantSince = computer.uptime()
+            lastE = cur
+        elseif computer.uptime() - stagnantSince > 5 then
+            log(string.format("[ЭНЕРГИЯ] не растёт (%.0f%%), питание не подключено?",
+                cur))
+            return false
+        end
+    end
+    return false
+end
+
+-- ---------- Безопасный дамп с лимитами ----------
 local function dump(v, indent, depth, seen)
     indent = indent or ""
     depth  = depth  or 0
@@ -336,19 +147,29 @@ local function dump(v, indent, depth, seen)
     if seen[v] then return "<circular>" end
     seen[v] = true
 
-    if next(v) == nil then return "{}" end
+    -- Считаем размер таблицы (с ранним выходом)
+    local count = 0
+    for _ in pairs(v) do
+        count = count + 1
+        if count > MAX_DUMP then break end
+    end
+
+    if count == 0 then return "{}" end
+
+    -- Большая таблица — только размер, без рекурсивного дампа
+    if count > MAX_DUMP then
+        local realCount = 0
+        for _ in pairs(v) do realCount = realCount + 1 end
+        return string.format("<table: %d элементов, дамп пропущен (--max-size N)>",
+                             realCount)
+    end
 
     local keys = {}
     for k in pairs(v) do table.insert(keys, k) end
     pcall(table.sort, keys, function(a, b) return tostring(a) < tostring(b) end)
 
     local lines = {"{"}
-    local maxItems = 30
-    for i, k in ipairs(keys) do
-        if i > maxItems then
-            table.insert(lines, indent .. "  ... ещё " .. (#keys - maxItems) .. " элементов")
-            break
-        end
+    for _, k in ipairs(keys) do
         local kStr = type(k) == "string" and k or ("[" .. tostring(k) .. "]")
         local val  = dump(v[k], indent .. "  ", depth + 1, seen)
         table.insert(lines, indent .. "  " .. kStr .. " = " .. val .. ",")
@@ -357,16 +178,111 @@ local function dump(v, indent, depth, seen)
     return table.concat(lines, "\n")
 end
 
--- ============================================================================
--- СБОР ИНФОРМАЦИИ ПО ОДНОМУ КОМПОНЕНТУ
--- ============================================================================
+-- ---------- Эвристика классификации (расширенная под HiTech) ----------
+local KNOWN_COMPONENTS = {
+    -- OC core
+    ["computer"]           = "Управление самим ПК",
+    ["gpu"]                = "Графический процессор",
+    ["screen"]             = "Экран — источник touch/scroll",
+    ["filesystem"]         = "Файловая система (HDD/диск)",
+    ["eeprom"]             = "BIOS компьютера",
+    ["modem"]              = "Сетевая карта",
+    ["tunnel"]             = "Linked-card",
+    ["redstone"]           = "I/O редстоуна",
+    ["internet"]           = "Internet Card",
+    ["data"]               = "Карта данных (хеш, шифр)",
+    ["transposer"]         = "Транспозер",
+    ["geolyzer"]           = "Геоанализатор",
+    ["motion_sensor"]      = "Датчик движения",
+    -- Flux
+    ["flux_controller"]    = "Flux Network контроллер",
+    ["flux_plug"]          = "Flux ввод",
+    ["flux_point"]         = "Flux вывод",
+    ["flux_storage"]       = "Flux накопитель",
+    -- AE2
+    ["me_controller"]      = "AE2 ME контроллер",
+    ["me_interface"]       = "AE2 ME интерфейс",
+    ["me_exportbus"]       = "AE2 экспорт",
+    ["me_importbus"]       = "AE2 импорт",
+    ["me_drive"]           = "AE2 привод",
+    ["me_inscriber"]       = "AE2 пресс",
+    -- Computronics
+    ["chat_box"]           = "Computronics чат-бокс",
+    ["tape_drive"]         = "Computronics ленточный носитель",
+    ["colorful_lamp"]      = "Computronics RGB-лампа",
+    ["industrial_chunkloader"] = "Computronics чанклоадер",
+    ["radar"]              = "Computronics радар",
+    ["self_destruct"]      = "Computronics само-разрушитель",
+    -- Energy Control
+    ["energy_sensor"]      = "Energy Control датчик",
+    ["howler_alarm"]       = "Energy Control сирена",
+    ["info_panel"]         = "Energy Control инфо-панель",
+    ["info_panel_advanced"]= "Energy Control расш. панель",
+    -- OpenSecurity
+    ["os_alarm"]           = "OpenSecurity сирена",
+    ["os_cardwriter"]      = "OpenSecurity программатор карт",
+    ["os_doorcontroller"]  = "OpenSecurity контроллер двери",
+    ["os_keypad"]          = "OpenSecurity клавиатура",
+    ["os_magreader"]       = "OpenSecurity считыватель",
+    ["entity_detector"]    = "OpenSecurity детектор сущностей",
+    -- Прочие моды HiTech
+    ["modular_machinery"]  = "Modular Machinery контроллер",
+    ["mm_controller"]      = "Modular Machinery контроллер",
+    ["machine_controller"] = "Контроллер машины",
+    ["draconic_rfstorage"] = "Draconic Evolution энергоядро",
+    ["draconic_reactor"]   = "Draconic реактор (ОПАСНО без управления!)",
+    ["mfsu"]               = "IC2 MFSU накопитель",
+    ["mfe"]                = "IC2 MFE накопитель",
+    ["energy_cell"]        = "Thermal Expansion energy cell",
+    ["capacitor_bank"]     = "Ender IO банк конденсаторов",
+    ["bee_housing"]        = "Forestry улей",
+    ["industrial_apiary"]  = "Gendustry индустр. апиарий",
+}
+
+local NAME_HINTS = {
+    {"energy",     "Энергия"},        {"battery",   "Накопитель энергии"},
+    {"capacitor",  "Конденсатор"},    {"fluid",     "Жидкости"},
+    {"tank",       "Бак"},            {"reactor",   "Реактор"},
+    {"turbine",    "Турбина"},        {"generator", "Генератор"},
+    {"machine",    "Машина"},         {"controller","Контроллер"},
+    {"modular",    "Modular Machinery"}, {"ae2",     "AE2"},
+    {"draconic",   "Draconic"},       {"thermal",   "Thermal"},
+    {"ic2",        "IC2"},            {"enderio",   "Ender IO"},
+    {"computronic","Computronics"},   {"sensor",    "Датчик"},
+    {"alarm",      "Сирена"},         {"keypad",    "Клавиатура"},
+    {"bee",        "Пчёлы"},          {"apiary",    "Апиарий"},
+    {"miner",      "Шахтёр"},         {"holo",      "Голограмма"},
+}
+
+local function classify(name, methods)
+    local descriptions = {}
+    if KNOWN_COMPONENTS[name] then
+        table.insert(descriptions, KNOWN_COMPONENTS[name])
+    end
+    local lname = name:lower()
+    for _, hint in ipairs(NAME_HINTS) do
+        if lname:find(hint[1], 1, true) then
+            local dup = false
+            for _, e in ipairs(descriptions) do
+                if e == hint[2] then dup = true; break end
+            end
+            if not dup then table.insert(descriptions, hint[2]) end
+        end
+    end
+    if #descriptions == 0 then
+        return "Кастомный/неизвестный (см. список методов)"
+    end
+    return table.concat(descriptions, "; ")
+end
+
+-- ---------- Сбор информации по одному компоненту ----------
 local function probeComponent(addr, name)
     log("================================================================")
     log(" КОМПОНЕНТ: " .. name)
     log("================================================================")
-    log("Адрес:     " .. addr)
+    log("Адрес:       " .. addr)
+    log(string.format("Энергия ПК:  %.0f%%", energyPct()))
 
-    -- Получаем все методы и их флаги direct/async
     local okMethods, methods = pcall(component.methods, addr)
     if not okMethods or type(methods) ~= "table" then
         log("✗ Не удалось получить список методов: " .. tostring(methods))
@@ -374,17 +290,8 @@ local function probeComponent(addr, name)
         return
     end
 
-    -- Классификация
-    log("Назначение: " .. classify(name, methods))
+    log("Назначение:  " .. classify(name, methods))
     log("")
-
-    -- Получаем proxy для вызова методов
-    local okProxy, proxy = pcall(component.proxy, addr)
-    if not okProxy or not proxy then
-        log("✗ Не удалось получить proxy: " .. tostring(proxy))
-        log("")
-        return
-    end
 
     -- Список методов
     local methodList = {}
@@ -396,40 +303,76 @@ local function probeComponent(addr, name)
     log("--- Методы (" .. #methodList .. ") ---")
     for _, m in ipairs(methodList) do
         local doc = ""
-        pcall(function() doc = component.doc(addr, m.name) or "" end)
-        -- Сокращаем слишком длинные документации
-        if #doc > 150 then doc = doc:sub(1, 147) .. "..." end
-        log(string.format("  • %-32s %s%s",
+        if not NO_DOC then
+            pcall(function() doc = component.doc(addr, m.name) or "" end)
+            if #doc > 120 then doc = doc:sub(1, 117) .. "..." end
+        end
+        local heavy = HEAVY_METHODS[m.name] and " ⚠HEAVY" or ""
+        log(string.format("  • %-32s %s%s%s",
             m.name,
             m.direct and "[sync] " or "[async]",
-            doc ~= "" and ("→ " .. doc) or ""))
+            heavy,
+            doc ~= "" and (" → " .. doc) or ""))
+        os.sleep(0)  -- даём планировщику передышку
     end
     log("")
 
-    -- Прогон get/list/is методов
-    local probedAny = false
-    for _, m in ipairs(methodList) do
-        if m.name:match("^get") or m.name:match("^list") or m.name:match("^is") then
-            probedAny = true
-            log(">>> " .. m.name .. "()")
-            local ok, result = pcall(proxy[m.name])
-            if ok then
-                log(dump(result, "  "))
-            else
-                local errStr = tostring(result)
-                if errStr:match("argument") or errStr:match("аргумент")
-                   or errStr:match("expected") or errStr:match("missing") then
-                    log("  ARG_REQUIRED: " .. errStr)
-                else
-                    log("  ✗ ERROR: " .. errStr)
-                end
-            end
-            log("")
-        end
+    if NO_METHODS or QUICK then
+        log("(Прогон методов пропущен по флагу --no-methods/--quick)")
+        log("")
+        return
     end
 
-    if not probedAny then
-        log("(Нет get/list/is методов для автоматического прогона.)")
+    -- Получаем proxy
+    local okProxy, proxy = pcall(component.proxy, addr)
+    if not okProxy or not proxy then
+        log("✗ Не удалось получить proxy: " .. tostring(proxy))
+        log("")
+        return
+    end
+
+    -- Прогон get/list/is методов
+    log("--- Прогон getter-методов ---")
+    local skipped = 0
+    for _, m in ipairs(methodList) do
+        if m.name:match("^get") or m.name:match("^list") or m.name:match("^is") then
+
+            -- Защита от тяжёлых методов
+            if HEAVY_METHODS[m.name] and not FULL then
+                log(">>> " .. m.name .. "()  ⚠ ПРОПУЩЕН (--full чтобы включить)")
+                skipped = skipped + 1
+            else
+                -- Проверка энергии перед каждым вызовом
+                if energyPct() < 25 then
+                    log(string.format(
+                        "[ЭНЕРГИЯ %.0f%%] прерываюсь — недостаточно для безопасного продолжения.",
+                        energyPct()))
+                    log("Подключите Capacitor / Power Supply и запустите снова.")
+                    log("Промежуточный лог сохранён в " .. LOG_PATH)
+                    return "energy"
+                end
+
+                log(">>> " .. m.name .. "()")
+                local ok, result = pcall(proxy[m.name])
+                if ok then
+                    log(dump(result, "  "))
+                else
+                    local errStr = tostring(result)
+                    if errStr:match("argument") or errStr:match("expected")
+                       or errStr:match("missing") then
+                        log("  ARG_REQUIRED: " .. errStr)
+                    else
+                        log("  ✗ ERROR: " .. errStr)
+                    end
+                end
+                log("")
+                os.sleep(0.05)  -- пауза для перезарядки
+            end
+        end
+    end
+    if skipped > 0 then
+        log(string.format("(Пропущено тяжёлых методов: %d. Запустить с --full на свой риск.)",
+            skipped))
         log("")
     end
 end
@@ -440,20 +383,22 @@ end
 log("################################################################")
 log("# UNIVERSAL COMPONENT PROBE")
 log("# Дата: " .. os.date())
-if nameFilter then
-    log("# Фильтр: '" .. nameFilter .. "'")
-end
+log("# Энергия ПК на старте: " .. string.format("%.0f%%", energyPct()))
+log("# Режим: " .. (QUICK and "QUICK (только сводка)"
+                or NO_METHODS and "NO-METHODS (без прогона)"
+                or FULL and "FULL (включая тяжёлые методы)"
+                or "БЕЗОПАСНЫЙ (тяжёлые методы пропущены)"))
+if nameFilter then log("# Фильтр: '" .. nameFilter .. "'") end
 log("################################################################")
 log("")
 
--- Собираем список с фильтром
+-- Собираем компоненты с фильтром
 local components = {}
 for addr, name in component.list() do
     if not nameFilter or name:lower():find(nameFilter:lower(), 1, true) then
         table.insert(components, { addr = addr, name = name })
     end
 end
-
 table.sort(components, function(a, b)
     if a.name == b.name then return a.addr < b.addr end
     return a.name < b.name
@@ -461,14 +406,12 @@ end)
 
 log("Найдено компонентов: " .. #components)
 if nameFilter and #components == 0 then
-    log("")
-    log("Ни один компонент не подошёл под фильтр '" .. nameFilter .. "'.")
-    log("Запусти без аргументов чтобы увидеть полный список.")
+    log("Под фильтр '" .. nameFilter .. "' не подошёл ни один компонент.")
     if logFile then logFile:close() end
     return
 end
 
--- Сначала краткая сводка — какие имена и сколько
+-- Краткая сводка имён
 log("")
 log("=== СВОДКА ===")
 local nameCounts = {}
@@ -480,37 +423,62 @@ for n in pairs(nameCounts) do table.insert(sortedNames, n) end
 table.sort(sortedNames)
 for _, n in ipairs(sortedNames) do
     local desc = KNOWN_COMPONENTS[n]
-    log(string.format("  %-30s × %d   %s",
+    log(string.format("  %-32s × %d   %s",
         n, nameCounts[n], desc and ("— " .. desc) or ""))
 end
 log("")
 
--- Теперь подробный probe каждого
+if QUICK then
+    log("(--quick: пропускаю подробное сканирование. Запустите без флага для полного отчёта.)")
+    if logFile then logFile:close() end
+    print()
+    print("Сводка сохранена в " .. LOG_PATH)
+    return
+end
+
+-- Подробный probe каждого компонента
 log("=== ПОДРОБНО ===")
 log("")
 
-for _, c in ipairs(components) do
-    local ok, err = pcall(probeComponent, c.addr, c.name)
-    if not ok then
-        log("✗ probeComponent упал на " .. c.name .. ": " .. tostring(err))
-        log("")
+local stopped = false
+for i, c in ipairs(components) do
+    -- Перед каждым компонентом — проверка энергии
+    if energyPct() < 25 and i > 1 then
+        if not waitForEnergy(80, 30) then
+            log("")
+            log("[!] Сканирование прервано из-за нехватки энергии после " ..
+                (i - 1) .. " из " .. #components .. " компонентов.")
+            log("    Подключите более ёмкое питание или запустите снова с фильтром:")
+            log("    component_probe " .. c.name)
+            stopped = true
+            break
+        end
     end
+
+    log(string.format("[%d/%d]", i, #components))
+    local ok, result = pcall(probeComponent, c.addr, c.name)
+    if not ok then
+        log("✗ probeComponent упал на " .. c.name .. ": " .. tostring(result))
+        log("")
+    elseif result == "energy" then
+        stopped = true
+        break
+    end
+
+    -- Пауза между компонентами для подзарядки
+    os.sleep(0.1)
 end
 
--- Финал
 log("################################################################")
-log("# ГОТОВО")
+log("# ГОТОВО" .. (stopped and " (частично — прервано по энергии)" or ""))
+log("# Энергия ПК на финише: " .. string.format("%.0f%%", energyPct()))
 log("################################################################")
-log("Полный отчёт сохранён: " .. LOG_PATH)
+log("Полный отчёт: " .. LOG_PATH)
 log("")
 log("Что дальше:")
-log("  • viewer " .. LOG_PATH .. "  — открыть в просмотрщике с прокруткой")
-log("  • Найти интересный компонент в подробной части и его метод")
-log("  • Дёрнуть конкретный метод вручную из шелла:")
-log("      lua")
-log("      > c = require('component')")
-log("      > p = c.proxy('адрес_из_лога')")
-log("      > =p.методКоторыйНужен()")
+log("  • viewer " .. LOG_PATH .. "  — открыть в просмотрщике")
+log("  • component_probe <фильтр>  — изучить конкретную группу")
+log("  • component_probe --full    — прогнать ВСЕ методы (на свой риск)")
 
 if logFile then logFile:close() end
 
